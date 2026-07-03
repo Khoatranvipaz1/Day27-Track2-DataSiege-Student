@@ -6,6 +6,17 @@ See ../README.md for the full interface + toolkit reference, and
 from api import Verdict
 
 
+def _safe_mean(values):
+    return sum(values) / len(values) if values else None
+
+
+def _safe_stdev(values):
+    if len(values) < 2:
+        return 0.0
+    m = _safe_mean(values)
+    return (sum((v - m) ** 2 for v in values) / len(values)) ** 0.5
+
+
 def register(ctx):
     ctx.on("data_batch", check_data_batch)
     ctx.on("contract_checkpoint", check_contract_checkpoint)
@@ -32,6 +43,14 @@ def _no_alert(pillar, reason=None):
     return Verdict(alert=False, confidence=0.0, reason=reason or "no anomaly detected", pillar=pillar)
 
 
+def _rolling_stats(values):
+    if len(values) < 2:
+        return None, None
+    mean_value = _safe_mean(values)
+    std_value = _safe_stdev(values)
+    return mean_value, std_value
+
+
 def check_data_batch(payload, ctx):
     baseline = ctx.baseline
     result = _safe_tool_call(lambda: ctx.tools.batch_profile(payload["batch_id"]), ctx)
@@ -41,6 +60,7 @@ def check_data_batch(payload, ctx):
     row_count = result.get("row_count")
     null_rate = result.get("null_rate", {}).get("customer_id")
     mean_amount = result.get("mean_amount")
+    std_amount = result.get("std_amount")
     staleness_min = result.get("staleness_min")
 
     if row_count is None or null_rate is None or mean_amount is None or staleness_min is None:
@@ -58,6 +78,64 @@ def check_data_batch(payload, ctx):
         return _alert("mean amount too high", "checks")
     if staleness_min > baseline["staleness_min_max"]:
         return _alert("batch staleness too high", "checks")
+
+    state = ctx.state.setdefault("data_batch_history", [])
+    recent_alerts = ctx.state.get("data_batch_recent_alerts", 0)
+    if recent_alerts > 0:
+        ctx.state["data_batch_recent_alerts"] = recent_alerts - 1
+    if len(state) >= 3:
+        rows = [h["row_count"] for h in state]
+        means = [h["mean_amount"] for h in state]
+        nulls = [h["null_rate"] for h in state]
+        stds = [h["std_amount"] for h in state]
+        stales = [h["staleness_min"] for h in state]
+
+        row_mean, row_std = _rolling_stats(rows)
+        mean_mean, mean_std = _rolling_stats(means)
+        null_mean, null_std = _rolling_stats(nulls)
+        std_mean, std_std = _rolling_stats(stds)
+        stale_mean, stale_std = _rolling_stats(stales)
+
+        if row_std is not None and abs(row_count - row_mean) > max(2.5 * row_std, 18):
+            strong_row = abs(row_count - row_mean) > max(3.5 * row_std, 30)
+            if recent_alerts > 0 and not strong_row:
+                pass
+            else:
+                if row_count > row_mean:
+                    ctx.state["data_batch_recent_alerts"] = 2
+                    return _alert("volume spike", "checks")
+                ctx.state["data_batch_recent_alerts"] = 2
+                return _alert("volume drop", "checks")
+        if null_std is not None and null_rate - null_mean > max(2 * null_std, 0.003):
+            strong_null = null_rate - null_mean > max(3 * null_std, 0.006)
+            if recent_alerts > 0 and not strong_null:
+                pass
+            else:
+                ctx.state["data_batch_recent_alerts"] = 2
+                return _alert("customer_id null rate spike", "checks")
+        if stale_std is not None and staleness_min - stale_mean > max(2 * stale_std, 1.5):
+            strong_stale = staleness_min - stale_mean > max(3 * stale_std, 3)
+            if recent_alerts > 0 and not strong_stale:
+                pass
+            else:
+                ctx.state["data_batch_recent_alerts"] = 2
+                return _alert("batch freshness lag", "checks")
+        if mean_std is not None and abs(mean_amount - mean_mean) > max(3 * mean_std, 8):
+            ctx.state["data_batch_recent_alerts"] = 2
+            return _alert("distribution shift", "checks")
+        if std_mean is not None and std_amount - std_mean > max(2 * std_std, 4):
+            ctx.state["data_batch_recent_alerts"] = 2
+            return _alert("distribution shift", "checks")
+
+    state.append({
+        "row_count": row_count,
+        "null_rate": null_rate,
+        "mean_amount": mean_amount,
+        "std_amount": std_amount,
+        "staleness_min": staleness_min,
+    })
+    if len(state) > 10:
+        state.pop(0)
 
     return _no_alert("checks")
 
@@ -93,47 +171,66 @@ def check_lineage_run(payload, ctx):
         return _no_alert("lineage", "missing lineage_graph_slice fields")
 
     job = payload.get("job")
+    lineage_recent = ctx.state.get("lineage_recent_alerts", 0)
+    if lineage_recent > 0:
+        ctx.state["lineage_recent_alerts"] = lineage_recent - 1
     job_state = ctx.state.setdefault("lineage_jobs", {})
-    info = job_state.setdefault(job, {"expected_upstream": None, "observed_upstreams": [], "durations": []})
+    info = job_state.setdefault(job, {
+        "expected_upstream": None,
+        "observed_upstreams": [],
+        "durations": [],
+        "max_upstream_size": 0,
+    })
     actual_upstream_set = set(actual_upstream)
     expected_upstream = info["expected_upstream"]
-
-    if expected_upstream is not None and actual_upstream_set < expected_upstream:
-        info["observed_upstreams"].append(actual_upstream_set)
-        info["durations"].append(duration_ms)
-        return _alert("missing upstream lineage", "lineage")
-
-    if expected_upstream is None and len(actual_upstream_set) > 0:
-        if len(info["observed_upstreams"]) >= 2:
-            merged = set().union(*info["observed_upstreams"], actual_upstream_set)
-            if len(merged) > len(actual_upstream_set):
-                info["expected_upstream"] = merged
-        info["observed_upstreams"].append(actual_upstream_set)
-
-    if expected_upstream is None and len(info["observed_upstreams"]) >= 3:
-        info["expected_upstream"] = set().union(*info["observed_upstreams"])
-
-    if duration_ms > baseline["lineage_duration_ms_max"]:
-        info["observed_upstreams"].append(actual_upstream_set)
-        info["durations"].append(duration_ms)
-        return _alert("lineage runtime too long", "lineage")
-
-    if len(info["durations"]) >= 5:
-        mean = sum(info["durations"]) / len(info["durations"])
-        variance = sum((d - mean) ** 2 for d in info["durations"]) / len(info["durations"])
-        std = variance ** 0.5
-        if duration_ms > mean + 2 * std:
-            info["observed_upstreams"].append(actual_upstream_set)
-            info["durations"].append(duration_ms)
-            return _alert("lineage runtime anomaly", "lineage")
+    inputs = payload.get("inputs") or []
 
     if actual_downstream_count == 0:
         info["observed_upstreams"].append(actual_upstream_set)
         info["durations"].append(duration_ms)
+        info["max_upstream_size"] = max(info["max_upstream_size"], len(actual_upstream_set))
         return _alert("orphaned lineage run", "lineage")
+
+    if inputs and len(actual_upstream_set) < len(inputs):
+        info["observed_upstreams"].append(actual_upstream_set)
+        info["durations"].append(duration_ms)
+        info["max_upstream_size"] = max(info["max_upstream_size"], len(actual_upstream_set))
+        return _alert("missing upstream lineage", "lineage")
+
+    if expected_upstream is not None and expected_upstream - actual_upstream_set:
+        info["observed_upstreams"].append(actual_upstream_set)
+        info["durations"].append(duration_ms)
+        return _alert("missing upstream lineage", "lineage")
+
+    if info["max_upstream_size"] >= 2 and len(actual_upstream_set) < info["max_upstream_size"]:
+        info["observed_upstreams"].append(actual_upstream_set)
+        info["durations"].append(duration_ms)
+        return _alert("missing upstream lineage", "lineage")
+
+    if duration_ms > baseline["lineage_duration_ms_max"]:
+        info["observed_upstreams"].append(actual_upstream_set)
+        info["durations"].append(duration_ms)
+        info["max_upstream_size"] = max(info["max_upstream_size"], len(actual_upstream_set))
+        return _alert("lineage runtime too long", "lineage")
+
+    if len(info["durations"]) >= 4:
+        mean_d = sum(info["durations"]) / len(info["durations"])
+        variance = sum((d - mean_d) ** 2 for d in info["durations"]) / len(info["durations"])
+        std_d = variance ** 0.5
+        anomaly_margin = max(1.5 * std_d, 220)
+        if duration_ms > mean_d + anomaly_margin:
+            if lineage_recent > 0 and duration_ms < mean_d + max(1.8 * std_d, 280):
+                pass
+            else:
+                info["observed_upstreams"].append(actual_upstream_set)
+                info["durations"].append(duration_ms)
+                info["max_upstream_size"] = max(info["max_upstream_size"], len(actual_upstream_set))
+                ctx.state["lineage_recent_alerts"] = 2
+                return _alert("lineage runtime anomaly", "lineage")
 
     info["observed_upstreams"].append(actual_upstream_set)
     info["durations"].append(duration_ms)
+    info["max_upstream_size"] = max(info["max_upstream_size"], len(actual_upstream_set))
     if expected_upstream is None and len(info["observed_upstreams"]) >= 3:
         info["expected_upstream"] = set().union(*info["observed_upstreams"])
 
@@ -149,7 +246,20 @@ def check_feature_materialization(payload, ctx):
     mean_shift_sigma = result.get("mean_shift_sigma")
     if mean_shift_sigma is None:
         return _no_alert("ai_infra", "missing feature_drift fields")
+    # warn earlier when mean shift approaches threshold, but escalate only after repeat
+    fstate = ctx.state.setdefault("feature_warnings", {})
+    key = payload.get("feature_view")
+    count = fstate.get(key, 0)
+    if mean_shift_sigma > 0.8 * baseline["feature_mean_shift_sigma_max"] and mean_shift_sigma <= baseline["feature_mean_shift_sigma_max"]:
+        count += 1
+        fstate[key] = count
+        if count >= 2:
+            fstate[key] = 0
+            return _alert("feature mean shift too large", "ai_infra")
+    else:
+        fstate[key] = 0
     if mean_shift_sigma > baseline["feature_mean_shift_sigma_max"]:
+        fstate[key] = 0
         return _alert("feature mean shift too large", "ai_infra")
 
     return _no_alert("ai_infra")
@@ -166,9 +276,43 @@ def check_embedding_batch(payload, ctx):
     if centroid_shift is None or avg_doc_age_days is None:
         return _no_alert("ai_infra", "missing embedding_drift fields")
 
-    if centroid_shift > baseline["embedding_centroid_shift_max"]:
-        return _alert("embedding centroid shift too large", "ai_infra")
-    if avg_doc_age_days > baseline["corpus_avg_doc_age_days_max"]:
-        return _alert("corpus document age too high", "ai_infra")
+    embed_recent = ctx.state.get("embedding_recent_alerts", 0)
+    if embed_recent > 0:
+        ctx.state["embedding_recent_alerts"] = embed_recent - 1
+    estate = ctx.state.setdefault("embedding_history", {})
+    entry = estate.setdefault(payload.get("corpus"), {"centroids": [], "ages": []})
+    centroids = entry["centroids"]
+    ages = entry["ages"]
+
+    if len(centroids) >= 3 and len(ages) >= 3:
+        mean_centroid, std_centroid = _rolling_stats(centroids)
+        mean_age, std_age = _rolling_stats(ages)
+        if mean_centroid is not None and mean_age is not None:
+            centroid_dev = centroid_shift - mean_centroid
+            if centroid_shift > mean_centroid + max(1.2 * std_centroid, 0.008) and avg_doc_age_days < mean_age + max(std_age, 6) and avg_doc_age_days < 28:
+                if embed_recent > 0 and centroid_dev < max(1.5 * std_centroid, 0.015):
+                    pass
+                else:
+                    ctx.state["embedding_recent_alerts"] = 2
+                    return _alert("embedding drift", "ai_infra")
+            if avg_doc_age_days > max(mean_age + max(1.2 * std_age, 5), 35) and centroid_shift < 0.018:
+                if embed_recent > 0 and avg_doc_age_days < mean_age + max(1.5 * std_age, 8):
+                    pass
+                else:
+                    ctx.state["embedding_recent_alerts"] = 2
+                    return _alert("corpus staleness", "ai_infra")
+    if centroid_shift > 0.03 and avg_doc_age_days < 28:
+        ctx.state["embedding_recent_alerts"] = 2
+        return _alert("embedding drift", "ai_infra")
+    if avg_doc_age_days > 35 and centroid_shift < 0.018:
+        ctx.state["embedding_recent_alerts"] = 2
+        return _alert("corpus staleness", "ai_infra")
+
+    centroids.append(centroid_shift)
+    ages.append(avg_doc_age_days)
+    if len(centroids) > 10:
+        centroids.pop(0)
+    if len(ages) > 10:
+        ages.pop(0)
 
     return _no_alert("ai_infra")
