@@ -1,3 +1,20 @@
 .venv/
 __pycache__/
 *.pyc
+
+# Local analysis / debug scratch — never submit. Several of these decrypt the
+# private schedule for offline inspection, which RULES.md forbids in a
+# submission; keep them out of the repo entirely.
+analysis_private.py
+analyze_private_misses.py
+compute_private_stats.py
+data_batch_analysis.py
+debug_data_batch_history.py
+debug_data_batch_selected.py
+debug_data_batch_thresholds.py
+debug_private_thresholds.py
+fp_stats.py
+inspect_private_stats.py
+private_miss_debug.py
+misses.json
+*.out
